@@ -11,10 +11,6 @@
 #                                                                   #
 #####################################################################
 
-spinning_top = False
-
-import figure_manager
-
 from dataframe_utilities import get_series_from_shot as _get_singleshot
 from dataframe_utilities import dict_diff
 import os
@@ -27,12 +23,45 @@ import sys
 
 import labscript_utils.h5_lock, h5py
 import pandas
-from pylab import array, ndarray
+from numpy import array, ndarray
 import types
 
 from zprocess import zmq_get
 
-__version__ = '1.0.2-dev'
+__version__ = '2.1.0'
+
+try:
+    from labscript_utils import check_version
+except ImportError:
+    raise ImportError('Require labscript_utils > 2.1.0')
+
+# require pandas v0.15.0 up to the next major version
+check_version('pandas', '0.15.0', '1.0')
+check_version('zprocess', '2.2', '3.0')
+
+# If running stand-alone, and not from within lyse, the below two variables
+# will be as follows. Otherwise lyse will override them with spinning_top =
+# True and path <name of hdf5 file being analysed>:
+spinning_top = False
+
+if len(sys.argv) > 1:
+    path = sys.argv[1]
+else:
+    path = None
+
+
+class _RoutineStorage(object):
+    """An empty object that analysis routines can store data in. It will
+    persist from one run of an analysis routine to the next when the routine
+    is being run from within lyse. No attempt is made to store data to disk,
+    so if the routine is run multiple times from the command line instead of
+    from lyse, or the lyse analysis subprocess is restarted, data will not be
+    retained. An alternate method should be used to store data if desired in
+    these cases."""
+    pass
+
+routine_storage = _RoutineStorage()
+
 
 def data(filepath=None, host='localhost', timeout=5):
     if filepath is not None:
@@ -40,9 +69,11 @@ def data(filepath=None, host='localhost', timeout=5):
     else:
         port = 42519
         df = zmq_get(port, host, 'get dataframe', timeout)
-        df = df.convert_objects(convert_numeric=True, convert_dates=False)
         try:
-            df.set_index(['sequence','run time'], inplace=True, drop=False)
+            padding = ('',)*(df.columns.nlevels - 1)
+            df.set_index([('sequence',) + padding,('run time',) + padding], inplace=True, drop=False)
+            df.index.names = ['sequence', 'run time']
+            # df.set_index(['sequence', 'run time'], inplace=True, drop=False)
         except KeyError:
             # Empty dataframe?
             pass
@@ -335,10 +366,10 @@ class Sequence(Run):
             self.no_write = True
         
     def get_trace(self,*args):
-        return {path:run.get_trace(*args) for run,path in self.runs.items()}
+        return {path:run.get_trace(*args) for path,run in self.runs.items()}
         
     def get_result_array(self,*args):
-        return {path:run.get_result_array(*args) for run,path in self.runs.items()}
+        return {path:run.get_result_array(*args) for path,run in self.runs.items()}
          
     def get_traces(self,*args):
         raise NotImplementedError('If you want to use this feature please ask me to implement it! -Chris')
@@ -348,3 +379,32 @@ class Sequence(Run):
      
     def get_image(self,*args):
         raise NotImplementedError('If you want to use this feature please ask me to implement it! -Chris')     
+
+
+def figure_to_clipboard(figure=None, **kwargs):
+    """Copy a matplotlib figure to the clipboard as a png. If figure is None,
+    the current figure will be copied. Copying the figure is implemented by
+    calling figure.savefig() and then copying the image data from the
+    resulting file. Any keyword arguments will be passed to the call to
+    savefig(). If bbox_inches keyword arg is not provided,
+    bbox_inches='tight' will be used"""
+    
+    import matplotlib.pyplot as plt
+    from zprocess import start_daemon
+    import tempfile
+
+    if not 'bbox_inches' in kwargs:
+        kwargs['bbox_inches'] = 'tight'
+               
+    if figure is None:
+        figure = plt.gcf()
+
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+        tempfile_name = f.name
+
+    figure.savefig(tempfile_name, **kwargs)
+
+    import lyse
+    lyse_dir = os.path.dirname(os.path.abspath(lyse.__file__))
+    tempfile2clipboard = os.path.join(lyse_dir, 'tempfile2clipboard.py')
+    start_daemon([sys.executable, tempfile2clipboard, '--delete', tempfile_name])

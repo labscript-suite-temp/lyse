@@ -15,22 +15,13 @@ import labscript_utils.h5_lock, h5py
 import pandas
 import os
 from numpy import *
-import dateutil
-from timezones import localtz
-
+import tzlocal
 import labscript_utils.shared_drive
 
 import runmanager
 
-# asdatetime = dateutil.parser.parse
-
-# def asdatetime(timestr):
-#     return localtz().localize(dateutil.parser.parse(timestr))
-
 def asdatetime(timestr):
-    # tz = localtz().zone
-    tz = 'Australia/Melbourne'
-    # tz = None
+    tz = tzlocal.get_localzone().zone
     return pandas.Timestamp(timestr, tz=tz)
 
 def get_nested_dict_from_shot(filepath):
@@ -53,8 +44,12 @@ def get_nested_dict_from_shot(filepath):
                                 if not isinstance(val, h5py.Reference):
                                     row[orientation][label][image][key] = val
         row['filepath'] = filepath
-        row['agnostic_path'] = labscript_utils.shared_drive.path_to_local(filepath)
-        row['sequence'] = asdatetime(h5_file.attrs['sequence_id'].split('_')[0])        
+        row['agnostic_path'] = labscript_utils.shared_drive.path_to_agnostic(filepath)
+        row['sequence'] = asdatetime(h5_file.attrs['sequence_id'].split('_')[0])
+        try:
+            row['sequence_index'] = h5_file.attrs['sequence_index']
+        except KeyError:
+            row['sequence_index'] = None
         if 'script' in h5_file: 
             row['labscript'] = h5_file['script'].attrs['name']
         try:
@@ -119,6 +114,9 @@ def get_dataframe_from_shot(filepath):
     df = flat_dict_to_hierarchical_dataframe(flat_dict)
     return df
     
+def get_dataframe_from_shots(filepaths):
+    return concat_with_padding(*[get_dataframe_from_shot(filepath) for filepath in filepaths])
+
 def get_series_from_shot(filepath):
     nested_dict = get_nested_dict_from_shot(filepath)
     flat_dict =  flatten_dict(nested_dict)
@@ -138,28 +136,34 @@ def pad_columns(df, n):
     index = pandas.MultiIndex.from_tuples(new_columns)
     return pandas.DataFrame(data,columns = index)
 
-def concat_with_padding(df1, df2):
-    """Concatenates two dataframes with MultiIndex column labels,
-    padding the shallower hierarchy such that the two MultiIndexes have
+def concat_with_padding(*dataframes):
+    """Concatenates dataframes with MultiIndex column labels,
+    padding shallower hierarchies such that the MultiIndexes have
     the same nlevels."""
-    if df1.columns.nlevels < df2.columns.nlevels:
-        df1 = pad_columns(df1, df2.columns.nlevels)
-    elif df1.columns.nlevels > df2.columns.nlevels:
-        df2 = pad_columns(df2, df1.columns.nlevels)
-    return df1.append(df2, ignore_index=True)
+    dataframes = list(dataframes)
+    # Remove empty dataframes (these don't concat since pandas 0.18) 
+    dataframes = [df for df in dataframes if not df.empty]
+    max_nlevels = max(df.columns.nlevels for df in dataframes)
+    for i, df in enumerate(dataframes):
+        if df.columns.nlevels < max_nlevels:
+            dataframes[i] = pad_columns(df, max_nlevels)
+    return pandas.concat(dataframes, ignore_index=True)
     
-def replace_with_padding(df,row,index):
+def replace_with_padding(df, row, index):
     if df.columns.nlevels < row.columns.nlevels:
         df = pad_columns(df, row.columns.nlevels)
     elif df.columns.nlevels > row.columns.nlevels:
         row = pad_columns(row, df.columns.nlevels)
-    # Wow, changing the index of a single row dataframe is a pain in
-    # the neck:
-    row = pandas.DataFrame(row.ix[0],columns=[index]).T
-    # Wow, replacing a row of a dataframe is a pain in the neck:
+
+    # Change the index of the row object to equal that of where it is to be
+    # inserted:
+    row.index = pandas.Int64Index([index])
+
+    # Replace the target row in the dataframe by dropping, appending, then
+    # sorting by index:
     df = df.drop([index])
     df = df.append(row)
-    df = df.sort()
+    df = df.sort_index()
     return df
     
 def dict_diff(dict1, dict2):
