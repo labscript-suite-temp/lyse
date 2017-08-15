@@ -1715,12 +1715,12 @@ class FileBox(object):
         self.to_singleshot.put(filepath)
         while True:
             signal, status_percent, updated_data = self.from_singleshot.get()
-            if signal in ['error', 'progress']:
-                for file in updated_data:
-                    self.shots_model.update_row(file, status_percent=status_percent, updated_row_data=updated_data[file])
+            for file in updated_data:
+                # Update the data for all the rows with new data:
+                self.shots_model.update_row(file, updated_row_data=updated_data[file])
+            # Update the status percent for the the row on which analysis is actually running:
+            self.shots_model.update_row(filepath, status_percent=status_percent, dataframe_already_updated=True)
             if signal == 'done':
-                # No need to update the dataframe again, that should have been done with the last 'progress' signal:
-                self.shots_model.update_row(filepath, status_percent=status_percent, dataframe_already_updated=True)
                 return
             if signal == 'error':
                 if not os.path.exists(filepath):
@@ -1730,6 +1730,9 @@ class FileBox(object):
                 else:
                     self.pause_analysis()
                 return
+            if signal == 'progress':
+                continue
+            raise ValueError('invalid signal %s' % str(signal))
                         
     def do_multishot_analysis(self):
         self.to_multishot.put(None)
@@ -1782,7 +1785,6 @@ class Lyse(object):
         # self.ui.showMaximized()
 
     def setup_config(self):
-        config_path = os.path.join(config_prefix, '%s.ini' % socket.gethostname())
         required_config_params = {"DEFAULT": ["experiment_name"],
                                   "programs": ["text_editor",
                                                "text_editor_arguments",
@@ -1793,7 +1795,7 @@ class Lyse(object):
                                             "analysislib"],
                                   "ports": ["lyse"]
                                   }
-        self.exp_config = LabConfig(config_path, required_config_params)
+        self.exp_config = LabConfig(required_params=required_config_params)
 
     def connect_signals(self):
         if os.name == 'nt':
