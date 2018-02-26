@@ -5,13 +5,12 @@ from __future__ import division, unicode_literals, print_function, absolute_impo
 import os
 import sys
 import socket
-import Queue
 import logging
 import threading
 import signal
 import subprocess
 import time
-
+import traceback
 import pprint
 import ast
 
@@ -31,9 +30,7 @@ try:
 except ImportError:
     raise ImportError('Require labscript_utils > 2.1.0')
 
-check_version('labscript_utils', '2.1', '3.0')
 check_version('qtutils', '2.0.0', '3.0.0')
-check_version('zprocess', '1.1.7', '3.0')
 
 import zprocess.locking
 from zprocess import ZMQServer
@@ -53,6 +50,13 @@ from qtutils import inmain_decorator, UiLoader, DisconnectContextManager
 from qtutils.outputbox import OutputBox
 from qtutils.auto_scroll_to_end import set_auto_scroll_to_end
 import qtutils.icons
+
+from labscript_utils import PY2
+if PY2:
+    str = unicode
+    import Queue as queue
+else:
+    import queue
 
 # Set working directory to lyse folder, resolving symlinks
 lyse_dir = os.path.dirname(os.path.realpath(__file__))
@@ -153,6 +157,17 @@ def scientific_notation(x, sigfigs=4, mode='eng'):
                 superscript = ''.join(sups.get(char, char) for char in str(exponent))
                 result += thinspace + times + thinspace + '10' + superscript
     return result
+
+
+def get_screen_geometry():
+    """Return the a list of the geometries of each screen: each a tuple of
+    left, top, width and height"""
+    geoms = []
+    desktop = qapplication.desktop()
+    for i in range(desktop.screenCount()):
+        sg = desktop.screenGeometry(i)
+        geoms.append((sg.left(), sg.top(), sg.width(), sg.height()))
+    return geoms
 
 
 class WebServer(ZMQServer):
@@ -867,10 +882,14 @@ class EditColumns(object):
         self.ui.treeView.resizeColumnToContents(self.COL_VISIBLE)
         # Which indices in self.columns_visible the row numbers correspond to
         self.column_indices = {}
-        for column_index, name in sorted(column_names.items(), key=lambda s: s[1]):
-            if not isinstance(name, tuple):
-                # one of our special columns, ignore:
-                continue
+
+        # Remove our special columns from the dict of column names by keeping only tuples:
+        column_names = {i: name for i, name in column_names.items() if isinstance(name, tuple)}
+
+        # Sort the column names as comma separated values, converting to lower case:
+        sortkey = lambda item: ', '.join(item[1]).lower().strip(', ')
+
+        for column_index, name in sorted(column_names.items(), key=sortkey):
             visible = columns_visible[column_index]
             visible_item = QtGui.QStandardItem()
             visible_item.setCheckable(True)
@@ -882,7 +901,7 @@ class EditColumns(object):
                 visible_item.setData(QtCore.Qt.Unchecked, self.ROLE_SORT_DATA)
             name_as_string = ', '.join(name).strip(', ')
             name_item = QtGui.QStandardItem(name_as_string)
-            name_item.setData(name_as_string, self.ROLE_SORT_DATA)
+            name_item.setData(sortkey((column_index, name)), self.ROLE_SORT_DATA)
             self.model.appendRow([visible_item, name_item])
             self.column_indices[self.model.rowCount() - 1] = column_index
 
@@ -1151,6 +1170,12 @@ class DataFrameModel(QtCore.QObject):
         self._view.setSelectionBehavior(QtWidgets.QTableView.SelectRows)
         self._view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
 
+        # Check if integer indexing is to be used
+        try:
+            self.integer_indexing = self.exp_config.getboolean('lyse', 'integer_indexing')
+        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+            self.integer_indexing = False
+
         # This dataframe will contain all the scalar data
         # from the shot files that are currently open:
         index = pandas.MultiIndex.from_tuples([('filepath', '')])
@@ -1331,7 +1356,22 @@ class DataFrameModel(QtCore.QObject):
 
         if updated_row_data is not None and not dataframe_already_updated:
             for group, name in updated_row_data:
-                self.dataframe.loc[df_row_index, (group, name) + ('',) * (self.nlevels - 2)] = updated_row_data[group, name]
+                column_name = (group, name) + ('',) * (self.nlevels - 2)
+                value = updated_row_data[group, name]
+                try:
+                    self.dataframe.set_value(df_row_index, column_name, value)
+                except ValueError:
+                    # did the column not already exist when we tried to set an iterable?
+                    if not column_name in self.dataframe.columns:
+                        # create it with a non-iterable and then overwrite with the iterable value:
+                        self.dataframe.set_value(df_row_index, column_name, None)
+                    else:
+                        # Incompatible datatype - convert the datatype of the column to
+                        # 'object'
+                        self.dataframe[column_name] = self.dataframe[column_name].astype('object')
+                    # Now that the column exists and has dtype object, we can set the value:
+                    self.dataframe.set_value(df_row_index, column_name, value)
+
             dataframe_already_updated = True
 
         if not dataframe_already_updated:
@@ -1443,11 +1483,23 @@ class DataFrameModel(QtCore.QObject):
         print(self._model.rowCount())
         for row_number in range(self._model.rowCount()):
             vertical_header_item = self._model.verticalHeaderItem(row_number)
-            filepath_item = self._model.item(row_number, self.COL_FILEPATH)
-            filepath = filepath_item.text()
-            basename = os.path.splitext(os.path.basename(filepath))[0]
             row_number_str = str(row_number).rjust(n_digits)
-            vert_header_text = '{}. | {}'.format(row_number_str, basename)
+            vert_header_text = '{}. |'.format(row_number_str)
+            if self.integer_indexing:
+                header_cols = ['sequence_index', 'run number', 'run repeat']
+                header_strings = []
+                for col in header_cols:
+                    try:
+                        val = self.dataframe[col].values[row_number]
+                        header_strings.append(' {:04d}'.format(val))
+                    except (KeyError, ValueError):
+                        header_strings.append('----')
+                vert_header_text += ' |'.join(header_strings)
+            else:
+                filepath_item = self._model.item(row_number, self.COL_FILEPATH)
+                filepath = filepath_item.text()
+                basename = os.path.splitext(os.path.basename(filepath))[0]
+                vert_header_text += ' ' + basename
             vertical_header_item.setText(vert_header_text)
     
     @inmain_decorator()
@@ -1534,7 +1586,7 @@ class FileBox(object):
         # A queue for storing incoming files from the ZMQ server so
         # the server can keep receiving files even if analysis is slow
         # or paused:
-        self.incoming_queue = Queue.Queue()
+        self.incoming_queue = queue.Queue()
 
         # Start the thread to handle incoming files, and store them in
         # a buffer if processing is paused:
@@ -1642,7 +1694,7 @@ class FileBox(object):
                 while True:
                     try:
                         filepath = self.incoming_queue.get(False)
-                    except Queue.Empty:
+                    except queue.Empty:
                         break
                     else:
                         filepaths.append(filepath)
@@ -1704,30 +1756,42 @@ class FileBox(object):
         # imported. So we'll silence them in this thread too:
         h5py._errors.silence_errors()
         while True:
-            self.analysis_pending.wait()
-            self.analysis_pending.clear()
-            at_least_one_shot_analysed = False
-            while True:
-                if not self.analysis_paused:
-                    # Find the first shot that has not finished being analysed:
-                    filepath = self.shots_model.get_first_incomplete()
-                    if filepath is not None:
-                        logger.info('analysing: %s'%filepath)
-                        self.do_singleshot_analysis(filepath)
-                        at_least_one_shot_analysed = True
-                    if filepath is None and at_least_one_shot_analysed:
-                        self.multishot_required = True
-                    if filepath is None:
+            try:
+                self.analysis_pending.wait()
+                self.analysis_pending.clear()
+                at_least_one_shot_analysed = False
+                while True:
+                    if not self.analysis_paused:
+                        # Find the first shot that has not finished being analysed:
+                        filepath = self.shots_model.get_first_incomplete()
+                        if filepath is not None:
+                            logger.info('analysing: %s'%filepath)
+                            self.do_singleshot_analysis(filepath)
+                            at_least_one_shot_analysed = True
+                        if filepath is None and at_least_one_shot_analysed:
+                            self.multishot_required = True
+                        if filepath is None:
+                            break
+                        if self.multishot_required:
+                            logger.info('doing multishot analysis')
+                            self.do_multishot_analysis()
+                    else:
+                        logger.info('analysis is paused')
                         break
-                    if self.multishot_required:
-                        logger.info('doing multishot analysis')
-                        self.do_multishot_analysis()
-                else:
-                    logger.info('analysis is paused')
-                    break
-            if self.multishot_required:
-                logger.info('doing multishot analysis')
-                self.do_multishot_analysis()
+                if self.multishot_required:
+                    logger.info('doing multishot analysis')
+                    self.do_multishot_analysis()
+            except Exception:
+                etype, value, tb = sys.exc_info()
+                orig_exception = ''.join(traceback.format_exception_only(etype, value))
+                message = ('Analysis loop encountered unexpected exception. ' +
+                           'This is a bug and should be reported. The analysis ' +
+                           'loop is continuing, but lyse may be in an inconsistent state. '
+                           'Restart lyse, or continue at your own risk. '
+                           'Original exception was:\n\n' + orig_exception)
+                # Raise the exception in a thread so we can keep running
+                zprocess.raise_exception_in_thread((RuntimeError, RuntimeError(message), tb))
+                self.pause_analysis()
             
    
     @inmain_decorator()
@@ -1795,12 +1859,12 @@ class Lyse(object):
 
         # The singleshot routinebox will be connected to the filebox
         # by queues:
-        to_singleshot = Queue.Queue()
-        from_singleshot = Queue.Queue()
+        to_singleshot = queue.Queue()
+        from_singleshot = queue.Queue()
 
         # So will the multishot routinebox:
-        to_multishot = Queue.Queue()
-        from_multishot = Queue.Queue()
+        to_multishot = queue.Queue()
+        from_multishot = queue.Queue()
 
         self.output_box = OutputBox(self.ui.verticalLayout_output_box)
         self.singleshot_routinebox = RoutineBox(self.ui.verticalLayout_singleshot_routinebox, self.exp_config,
@@ -1898,8 +1962,8 @@ class Lyse(object):
             except LabConfig.NoOptionError:
                 self.exp_config.set('DEFAULT', 'app_saved_configs', os.path.join('%(labscript_suite)s', 'userlib', 'app_saved_configs', '%(experiment_name)s'))
                 default_path = os.path.join(self.exp_config.get('DEFAULT', 'app_saved_configs'), 'lyse')
-                if not os.path.exists(default_path):
-                    os.makedirs(default_path)
+            if not os.path.exists(default_path):
+                os.makedirs(default_path)
 
             default = os.path.join(default_path, 'lyse.ini')
         save_file = QtWidgets.QFileDialog.getSaveFileName(self.ui,
@@ -1938,8 +2002,10 @@ class Lyse(object):
         window_size = self.ui.size()
         save_data['window_size'] = (window_size.width(), window_size.height())
         window_pos = self.ui.pos()
+
         save_data['window_pos'] = (window_pos.x(), window_pos.y())
 
+        save_data['screen_geometry'] = get_screen_geometry()
         save_data['splitter'] = self.ui.splitter.sizes()
         save_data['splitter_vertical'] = self.ui.splitter_vertical.sizes()
         save_data['splitter_horizontal'] = self.ui.splitter_horizontal.sizes()
@@ -2011,30 +2077,43 @@ class Lyse(object):
         except (LabConfig.NoOptionError, LabConfig.NoSectionError):
             pass
         try:
-            self.ui.resize(*ast.literal_eval(lyse_config.get('lyse_state', 'window_size')))
-        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
-            pass
-        try:
-            self.ui.move(*ast.literal_eval(lyse_config.get('lyse_state', 'window_pos')))
-        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
-            pass
-        try:
             if ast.literal_eval(lyse_config.get('lyse_state', 'analysis_paused')):
                 self.filebox.pause_analysis()
         except (LabConfig.NoOptionError, LabConfig.NoSectionError):
             pass
         try:
-            self.ui.splitter.setSizes(ast.literal_eval(lyse_config.get('lyse_state', 'splitter')))
+            screen_geometry = ast.literal_eval(lyse_config.get('lyse_state', 'screen_geometry'))
         except (LabConfig.NoOptionError, LabConfig.NoSectionError):
             pass
-        try:
-            self.ui.splitter_vertical.setSizes(ast.literal_eval(lyse_config.get('lyse_state', 'splitter_vertical')))
-        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
-            pass
-        try:
-            self.ui.splitter_horizontal.setSizes(ast.literal_eval(lyse_config.get('lyse_state', 'splitter_horizontal')))
-        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
-            pass
+        else:
+            # Only restore the window size and position, and splitter
+            # positions if the screen is the same size/same number of monitors
+            # etc. This prevents the window moving off the screen if say, the
+            # position was saved when 2 monitors were plugged in but there is
+            # only one now, and the splitters may not make sense in light of a
+            # different window size, so better to fall back to defaults:
+            current_screen_geometry = get_screen_geometry()
+            if current_screen_geometry == screen_geometry:
+                try:
+                    self.ui.resize(*ast.literal_eval(lyse_config.get('lyse_state', 'window_size')))
+                except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+                    pass
+                try:
+                    self.ui.move(*ast.literal_eval(lyse_config.get('lyse_state', 'window_pos')))
+                except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+                    pass
+                try:
+                    self.ui.splitter.setSizes(ast.literal_eval(lyse_config.get('lyse_state', 'splitter')))
+                except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+                    pass
+                try:
+                    self.ui.splitter_vertical.setSizes(ast.literal_eval(lyse_config.get('lyse_state', 'splitter_vertical')))
+                except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+                    pass
+                try:
+                    self.ui.splitter_horizontal.setSizes(ast.literal_eval(lyse_config.get('lyse_state', 'splitter_horizontal')))
+                except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+                    pass
 
         # Set as self.last_save_data:
         save_data = self.get_save_data()
